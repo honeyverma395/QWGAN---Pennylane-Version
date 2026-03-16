@@ -4,3 +4,4 @@
 *.pdf
 *.pkl
 *.pyc
+generated_data/
