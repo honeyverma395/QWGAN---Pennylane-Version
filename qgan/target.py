@@ -13,7 +13,6 @@ Unchanged:
 This module constructs the "answer" that the generator is trying to learn.
 Given a Hamiltonian H, we compute the time-evolution operator U = e^{-iH}
 and apply it to one half of a maximally entangled state (Choi representation).
-The resulting state is what the discriminator compares against the generator's output.
 """
 
 import sys

@@ -1,471 +1,360 @@
-"""Discriminator module — PennyLane-compatible version.
+"""Discriminator module — PyTorch-PennyLane version.
 
 The discriminator is NOT a quantum circuit, it is a classical parametrisation
-of two Hermitian operators (\psi, \phi) built from tensor products of Pauli matrices.
-That's why it stays as pure numpy/scipy linear algebra.
+of two Hermitian operators (psi, phi) built from tensor products of Pauli matrices.
 
-Changes from original:
-    - Removed dependency on MomentumOptimizer (optimizer.py eliminated).
-      Momentum update is now in this file.
-    - Removed dependency on tools.qobjects.qgates (qgates.py eliminated).
-      Pauli matrices defined locally.
-    - Everything else (gradient logic, load/save) unchanged, just adapted to Pennylane.
+Changes from PennyLane/numpy version:
+    - alpha and beta are now torch.nn.Parameter -> autograd handles ALL gradients.
+    - Manual gradient methods (_compute_grad, _grad_alpha, _grad_beta,
+      _grad_psi_or_phi) are REMOVED entirely.
+    - Momentum SGD via torch.optim.SGD(momentum=...).
+    - Loss computed via density matrices and torch.trace
+      Cross terms like <target|A|gen>·<gen|B|target> become Tr[A·rho_g·B·rho_t].
+    - save/load preserved, adapted for torch state_dict.
+
+The discriminator MAXIMISES the Wasserstein cost:
+    Loss = psi_term − phi_term − reg_term
+We put a minus sign and call optimizer.step() to minimise (−Loss).
 """
 
 import os
-import pickle
 from copy import deepcopy
 
 import numpy as np
-from scipy.linalg import expm
+import torch
+import torch.nn as nn
 
 from config import CFG
-from qgan.cost_functions import braket
 from data.data_managers import print_and_log
 
 
 # -- PAULI MATRICES ---------------------------------
-# The four single-qubit Pauli matrices form a basis for all 2×2 Hermitian
-# operators. Any Hermitian operator on one qubit can be written as a linear
-# combination:  H = a·I + b·X + c·Y + d·Z  with real coefficients a, b, c, d.
-# For multi-qubit systems, we take tensor (Kronecker) products of these.
-I = np.eye(2, dtype=complex)      
-X = np.array([[0, 1], [1, 0]], dtype=complex)   
-Y = np.array([[0, -1j], [1j, 0]], dtype=complex) 
-Z = np.array([[1, 0], [0, -1]], dtype=complex)    
+I = torch.eye(2, dtype=torch.complex128)
+X = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex128)
+Y = torch.tensor([[0, -1j], [1j, 0]], dtype=torch.complex128)
+Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex128)
+
+PAULIS = [I, X, Y, Z]
 
 
-# -- MOMENTUM OPTIMIZER  ---------------------------------
-class _MomentumState:
-    """Tracks velocity for SGD with momentum on a single parameter array.
+# -- BRAKET (torch version) ---------------------------------
+def braket(*args) -> torch.Tensor:
+    """Compute <bra| O_1 · O_2 · ... · O_n |ket> using torch tensors.
 
-    Standard momentum SGD update rule:
-        v_{t+1} = \mu·v_t + sign· \eta · \nabla  
-        \theta_{t+1} = \theta_t + v_{t+1}
+    Same interface as the numpy version in cost_functions.py, but
+    operates on torch tensors so autograd can differentiate through it.
 
-    where:
-        - \eta is the learning rate (step size),
-        - \mu is the momentum coefficient (how much of the previous velocity to retain),
-        - sign = +1 for maximisation (gradient ascent), -1 for minimisation (gradient descent).
+    Args:
+        args: (bra, [operators...], ket) — all torch tensors.
+              bra and ket are column vectors (shape [d, 1]).
+              Operators are square matrices (shape [d, d]).
 
-    Momentum helps smooth out noisy gradients and accelerate convergence
-    by accumulating a running average of past gradient directions.
+    Returns:
+        torch.Tensor: scalar (complex) inner product.
     """
-
-    def __init__(self, eta: float = CFG.l_rate, mu: float = CFG.momentum_coeff):
-        self.eta = eta   # Learning rate: controls the magnitude of each update step
-        self.mu = mu     # Momentum coefficient: fraction of previous velocity retained
-        self.v = None    # Velocity tensor
-
-    def step(self, params: np.ndarray, grad: np.ndarray,
-             maximise: bool = True) -> np.ndarray:
-        """One momentum update step.
-
-        On the first call, the velocity is initialised directly from the
-        scaled gradient (no momentum term yet). On subsequent calls, the
-        velocity blends the previous velocity with the new gradient.
-
-        Args:
-            params: Current parameters (any shape).
-            grad: Gradient (same shape as params).
-            maximise: If True, ascend (+grad). If False, descend (-grad).
-
-        Returns:
-            Updated parameters (same shape).
-        """
-        sign = 1.0 if maximise else -1.0
-
-        if self.v is None:
-            # First step: no previous velocity to blend with
-            self.v = sign * self.eta * grad
-        else:
-            # Subsequent steps: blend old velocity with new gradient
-            self.v = self.mu * self.v + sign * self.eta * grad
-
-        return params + self.v
+    bra, *ops, ket = args
+    for op in ops:
+        ket = torch.matmul(op, ket)
+    return torch.matmul(bra.conj().T, ket)
 
 
 # -- DISCRIMINATOR ---------------------------------
-# Wasserstein cost constants loaded from the global config.
-# These control the relative weight of different terms in the
-# regularisation expression that enforces the Lipschitz constraint.
-#   cst1, cst2, cst3: prefactors for the three cross-terms in the penalty
-#   lamb (\lambda): regularisation strength / temperature parameter
+# Wasserstein cost constants from config
 cst1, cst2, cst3, lamb = CFG.cst1, CFG.cst2, CFG.cst3, CFG.lamb
 
-class Discriminator:
-    """Discriminator class for the Quantum Wasserstein GAN.
 
-    The discriminator is parametrised by two sets of real coefficients
-    (\alpha, \beta), each of shape (N_qubits, 4), where 4 corresponds
-    to the Pauli basis {I, X, Y, Z}.
+class Discriminator(nn.Module):
+    """Discriminator for the Quantum Wasserstein GAN (PyTorch version).
 
-    From these coefficients two full Hermitian operators are built:
+    Parameters alpha, beta are nn.Parameters. The full forward pass
+    (alpha,beta -> psi, phi -> A,B -> loss) is differentiable via autograd.
 
-    Representation with coeff. in front of each Hermitian operator (N × 4):
-        - alpha: coefficients for the real part (\psi), I, X, Y, Z per qubit.
-        - beta:  coefficients for the imaginary part (\phi).
-
-    Matrix representation spanning the full space (2^N × 2^N):
-        - \psi = \otimes_i \sum_j \alpha_{ij}· \sigma_j
-        - \phi = \otimes_i \sum_j \beta_{ij} · \sigma_j
-
-    The Wasserstein distance is estimated from expectation values of \psi
-    and \phi on the target and generated states. A regularisation term
-    based on matrix exponentials enforces the Lipschitz constraint:
-
-    For computing the gradients:
-        - A = exp(-\phi/ \lambda)
-        - B = exp(\psi/ \lambda)
+    Usage:
+        dis = Discriminator()
+        loss = dis.compute_loss(final_target_state, final_gen_state)
+        loss.backward()
+        dis.optimizer.step()
+        dis.optimizer.zero_grad()
     """
 
     def __init__(self):
-        # The discriminator operates on a composite Hilbert space:
-        # Total number of qubits the discriminator acts on:
+        super().__init__()
+
+        # Total number of qubits the discriminator acts on
         self.size: int = (
             CFG.system_size * 2
             + (1 if CFG.extra_ancilla and CFG.ancilla_mode == "pass" else 0)
         )
 
-        # Pauli basis used to decompose per-qubit Hermitian operators
-        self.herm: list = [I, X, Y, Z]
+        # alpha and beta as trainable parameters (real-valued)
+        self.alpha = nn.Parameter(
+            -1 + 2 * torch.rand(self.size, 4, dtype=torch.float64)
+        )
+        self.beta = nn.Parameter(
+            -1 + 2 * torch.rand(self.size, 4, dtype=torch.float64)
+        )
 
-        # Randomly initialise the \alpha and \beta coefficient arrays
-        self._init_params_alpha_beta()
+        # Optimizer: SGD with momentum, MAXIMISING
+        self.optimizer = torch.optim.SGD(
+            self.parameters(),
+            lr=CFG.l_rate,
+            momentum=CFG.momentum_coeff,
+        )
 
-        # Momentum optimisers for \alpha (-> \psi) and \beta (-> \phi), both MAXIMISE
-        # The discriminator wants to maximise the Wasserstein distance estimate,
-        # so both parameter sets are updated via gradient ascent.
-        self.optimizer_psi = _MomentumState()
-        self.optimizer_phi = _MomentumState()
-
-        # Metadata for save/load compatibility checks
-        # These allow us to verify that a saved model is compatible
-        # with the current configuration before loading its parameters.
+        # Save/load compatibility
         self.ancilla: bool = CFG.extra_ancilla
         self.ancilla_mode: str = CFG.ancilla_mode
         self.target_size: int = CFG.system_size
         self.target_hamiltonian: str = CFG.target_hamiltonian
 
-    def _init_params_alpha_beta(self):
-        """Random initialisation of \alpha and \beta in [-1, 1].
+    # -- matrix representations ---------------------------------
+    def get_psi_and_phi(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build psi and phi matrices via Kronecker product of per-qubit Hermitians.
 
-        Each row corresponds to one qubit, and each column to a Pauli
-        operator (I, X, Y, Z). 
-        """
-        self.alpha: np.ndarray = -1 + 2 * np.random.random((self.size, 4))
-        self.beta: np.ndarray = -1 + 2 * np.random.random((self.size, 4))
+        For each qubit i:
+            H_i = \sum_j coeff[i][j] · \sigma_j    (real coeffs, Hermitian result)
 
-    # matrix representations ---------------------------------
-    def get_psi_and_phi(self) -> tuple[np.ndarray, np.ndarray]:
-        """Build \psi and \phi matrices via Kronecker product of per-qubit Hermitians.
-
-        For each qubit i, a local 2×2 Hermitian is formed:
-            H_i = \sum_j coeff[i][j] · \sigma_j
-
-        Then the full multi-qubit operator is the tensor product:
-            \psi = H_0 \otimes H_1 \otimes ... \otimes H_{N-1}
+        Full operator: psi = H_0 \otimes H_1 \otimes ... \otimes H_{N-1}
 
         Returns:
-            (\psi, \phi) each of shape (2^N, 2^N).
+            (\psi, \phi) each of shape (2^N, 2^N), complex128, on the autograd graph.
         """
-        # Start with scalar 1; successive Kronecker products build up the
-        # full 2^N × 2^N matrices incrementally.
-        psi, phi = 1, 1
+        # Cast alpha, beta to complex for matrix multiplication
+        alpha_c = self.alpha.to(torch.complex128)
+        beta_c = self.beta.to(torch.complex128)
+
+        psi = torch.tensor([[1.0]], dtype=torch.complex128)  # scalar 1 as 1×1 matrix
+        phi = torch.tensor([[1.0]], dtype=torch.complex128)
+
         for i in range(self.size):
-            # Build per-qubit operators by summing over the Pauli basis
-            psi_i = np.zeros((2, 2), dtype=complex)
-            phi_i = np.zeros((2, 2), dtype=complex)
-            for j, herm_j in enumerate(self.herm):
-                psi_i += self.alpha[i][j] * herm_j
-                phi_i += self.beta[i][j] * herm_j
-            # Kronecker product extends the operator to the next qubit
-            psi = np.kron(psi, psi_i)
-            phi = np.kron(phi, phi_i)
+            # Per-qubit Hermitian
+            psi_i = sum(alpha_c[i, j] * PAULIS[j] for j in range(4))
+            phi_i = sum(beta_c[i, j] * PAULIS[j] for j in range(4))
+            psi = torch.kron(psi, psi_i)
+            phi = torch.kron(phi, phi_i)
+
         return psi, phi
 
-    def get_dis_matrices_rep(self) -> tuple:
-        """Compute A = exp(-\phi/ \lambda) and B = exp(\psi/ \lambda).
-
-        These matrix exponentials appear in the Wasserstein dual formulation's
-        regularisation term. They enforce the Lipschitz constraint on the
-        discriminator: without regularisation, the discriminator could grow
-        \psi and \phi without bound, making the Wasserstein estimate diverge.
+    def get_dis_matrices_rep(self) -> tuple[torch.Tensor, torch.Tensor,
+                                            torch.Tensor, torch.Tensor]:
+        """Compute A = exp(−phi / lambda) and B = exp(+\psi / lambda).
 
         Returns:
-            (A, B, \phi, \psi): the exponentials and the raw Hermitian operators.
+            (A, B, psi, phi)
         """
         psi, phi = self.get_psi_and_phi()
-        A = expm(float(-1 / lamb) * phi)  # exp(-\phi / \lambda)
-        B = expm(float(1 / lamb) * psi)   # exp(+\psi / \lambda)
+        A = torch.linalg.matrix_exp((-1.0 / lamb) * phi)
+        B = torch.linalg.matrix_exp((1.0 / lamb) * psi)
         return A, B, psi, phi
 
-    # -- parameter update ---------------------------------
+    # -- loss computation (replaces manual gradients) ---------------------------------
+    def compute_loss(self, final_target_state: torch.Tensor,
+                     final_gen_state: torch.Tensor) -> torch.Tensor:
+        """Compute the Wasserstein cost as a differentiable scalar.
+
+        Uses density matrices and torch.trace instead of brakets:
+            <psi|O|psi>= Tr[O · rho]        where rho = |psi><psi|
+            <phi|O|psi>· <psi|O'|phi>= Tr[O · rho_psi · O' · rho_phi]  (cross terms)
+
+        Loss = psi_term − phi_term − reg_term
+
+        The discriminator MAXIMISES this, so we return − Loss for
+        minimisation with optimizer.step().
+
+        Args:
+            final_target_state: Target state, shape (d,) or (d, 1), complex128.
+            final_gen_state: Generator state, shape (d,) or (d, 1), complex128.
+
+        Returns:
+            torch.Tensor: scalar (real), the negated loss for minimisation.
+        """
+        A, B, psi, phi = self.get_dis_matrices_rep()
+
+        # Build density matrices
+        t = final_target_state.reshape(-1)
+        g = final_gen_state.reshape(-1)
+        rho_t = torch.outer(t, t.conj())  # |target><target|
+        rho_g = torch.outer(g, g.conj())  # |gen><gen|
+
+        # psi term: Tr[psi · rho_t]
+        psi_term = torch.trace(psi @ rho_t)
+
+        # phi term: Tr[phi · rho_g]
+        phi_term = torch.trace(phi @ rho_g)
+
+        # Regularisation terms:
+        t1 = torch.trace(A @ rho_g) * torch.trace(B @ rho_t)
+        t2 = torch.trace(A @ rho_g @ B @ rho_t)
+        t3 = torch.trace(A @ rho_t @ B @ rho_g)
+        t4 = torch.trace(A @ rho_t) * torch.trace(B @ rho_g)
+        reg_term = lamb / np.e * (cst1 * t1 - cst2 * (t2 + t3) + cst3 * t4)
+
+        # Full cost (real part to avoid numerical noise)
+        cost = (psi_term - phi_term - reg_term).real
+
+        # Negate for minimisation (discriminator maximises)
+        return -cost
+
+    # -- training step (replaces update_dis) ---------------------------------
     def update_dis(self, final_target_state: np.ndarray,
                    final_gen_state: np.ndarray):
-        """Update \alpha and \beta using momentum SGD (maximisation).
+        """One discriminator training step.
 
-        This is the discriminator's training step. Given the current target
-        state (from real data) and the generator's output state, it:
-            1. Builds the current A, B matrices from the parameters.
-            2. Computes gradients of the Wasserstein cost w.r.t. \alpha and \beta.
-            3. Applies momentum SGD to update both parameter sets.
+        Drop-in replacement for the old update_dis(). Converts numpy
+        states to torch, computes loss, backpropagates, and steps.
 
-        Gradients are computed for both \alpha and \beta before either
-        is updated, to avoid one update affecting the other's gradient.
-        This ensures the gradients are evaluated at the same point in parameter space.
+        Args:
+            final_target_state: numpy column vector (2^N, 1).
+            final_gen_state: numpy column vector (2^N, 1).
         """
-        A, B, _, _ = self.get_dis_matrices_rep()
-
-        # Compute gradients at the CURRENT parameter values
-        grad_alpha = self._compute_grad(
-            final_target_state, final_gen_state, A, B, "alpha"
+        # Convert numpy states to torch (no gradient needed for states here)
+        target_t = torch.tensor(
+            np.asarray(final_target_state), dtype=torch.complex128
         )
-        grad_beta = self._compute_grad(
-            final_target_state, final_gen_state, A, B, "beta"
+        gen_t = torch.tensor(
+            np.asarray(final_gen_state), dtype=torch.complex128
         )
 
-        # Apply momentum updates (maximise the Wasserstein distance estimate)
-        new_alpha = self.optimizer_psi.step(self.alpha, grad_alpha, maximise=True)
-        new_beta = self.optimizer_phi.step(self.beta, grad_beta, maximise=True)
+        self.optimizer.zero_grad()
+        loss = self.compute_loss(target_t, gen_t)
+        loss.backward()
+        self.optimizer.step()
 
-        # Update after both gradients are computed
-        self.alpha = new_alpha
-        self.beta = new_beta
+    # -- numpy interface for cost_functions.py compatibility ---------------------------------
+    def get_dis_matrices_rep_numpy(self) -> tuple[np.ndarray, np.ndarray,
+                                                   np.ndarray, np.ndarray]:
+        """Return (A, B, psi, phi) as numpy arrays (detached from graph).
 
-    # -- gradient computation ---------------------------------
-    def _compute_grad(self, final_target_state, final_gen_state,
-                      A, B, param: str) -> np.ndarray:
-        """Gradient of the Wasserstein cost w.r.t. \alpha or \beta.
-
-        The full gradient decomposes into three terms:
-            1. grad_psi_term: derivative of Tr[\psi · \rho_target]
-               (only non-zero for \alpha, since \psi depends on \alpha)
-            2. grad_phi_term: derivative of Tr[\phi · \rho_gen]
-               (only non-zero for \beta, since \phi depends on \beta)
-            3. grad_reg_term: derivative of the Lipschitz regularisation penalty
-
-        The final gradient is: grad_psi - grad_phi - grad_reg
-    
-        We iterate over each Hermitian type (I, X, Y, Z) separately because
-        the per-qubit structure allows the gradient to be decomposed this way.
-
-        Returns:
-            np.ndarray of shape (self.size, 4).
+        Use this when we need the matrices for the generator gradient
+        or for compute_cost() in cost_functions.py, which still works
+        with numpy.
         """
-        zero_param = self.alpha if param == "alpha" else self.beta
-        grad_psi_term = np.zeros_like(zero_param, dtype=complex)
-        grad_phi_term = np.zeros_like(zero_param, dtype=complex)
-        grad_reg_term = np.zeros_like(zero_param, dtype=complex)
-
-        # Loop over each Pauli type: 0=I, 1=X, 2=Y, 3=Z
-        for herm_type in range(len(self.herm)):
-            if param == "alpha":
-                gpsi, gphi, greg = self._grad_alpha(
-                    final_target_state, final_gen_state, A, B, herm_type
-                )
-            else:
-                gpsi, gphi, greg = self._grad_beta(
-                    final_target_state, final_gen_state, A, B, herm_type
-                )
-
-            # Each of gpsi, gphi, greg is a list of length self.size
-            # (one entry per qubit). Store them in the corresponding column.
-            grad_psi_term[:, herm_type] = np.asarray(gpsi)
-            grad_phi_term[:, herm_type] = np.asarray(gphi)
-            grad_reg_term[:, herm_type] = np.asarray(greg)
-
-        # Take the real part (the imaginary parts should be negligible
-        # since \psi, \phi are Hermitian and the states are physical).
-        return np.real(grad_psi_term - grad_phi_term - grad_reg_term)
-
-    def _grad_alpha(self, final_target_state, final_gen_state,
-                    A, B, herm_type):
-        """Gradient step w.r.t. \alpha for a given Hermitian type (I/X/Y/Z).
-
-        Since \psi depends on \alpha (and \phi does not), the \phi-term
-        gradient is always zero for \alpha derivatives.
-
-        For the \psi-term: d/d\alpha Tr[\psi · \rho_target] uses the
-        chain rule through the Kronecker product structure, for each qubit i,
-        the derivative replaces qubit i's linear combination with the bare
-        Pauli \sigma_{herm_type}, keeping all other qubits unchanged.
-
-        Args:
-            final_target_state: Target (real data) quantum state vector.
-            final_gen_state: Generator's output quantum state vector.
-            A: exp(-\phi / \lambda).
-            B: exp(+\psi / \lambda).
-            herm_type: Index into {I, X, Y, Z} (0, 1, 2, 3).
-
-        Returns:
-            (gpsi, gphi, greg): Three lists, each of length self.size,
-            containing per-qubit gradient contributions.
-        """
-        cs = 1 / lamb  # Scaling factor
-        # Get the list of gradient matrices: one per qubit, where qubit i
-        # has its Pauli combination replaced by the bare \sigma_{herm_type}
-        grad_psi_list = self._grad_psi_or_phi(herm_type, respect_to="psi")
-        gpsi, gphi, greg = [], [], []
-
-        for grad_psi in grad_psi_list:
-            # \psi term: <target | d\psi/d\alpha | target>
-            gpsi.append(np.ndarray.item(
-                braket(final_target_state, grad_psi, final_target_state)
-            ))
-            # \phi term: no dependence on \alpha, so gradient is zero
-            gphi.append(0)
-
-            # Regularisation term: four cross-braket products
-            # fmt: off
-            t1 = cs * braket(final_gen_state, A, final_gen_state) * braket(final_target_state, grad_psi, B, final_target_state)
-            t2 = cs * braket(final_gen_state, grad_psi, B, final_target_state) * braket(final_target_state, A, final_gen_state)
-            t3 = cs * braket(final_gen_state, A, final_target_state) * braket(final_target_state, grad_psi, B, final_gen_state)
-            t4 = cs * braket(final_gen_state, grad_psi, B, final_gen_state) * braket(final_target_state, A, final_target_state)
-            greg.append(np.ndarray.item(lamb / np.e * (cst1 * t1 - cst2 * (t2 + t3) + cst3 * t4)))
-            # fmt: on
-
-        return gpsi, gphi, greg
-
-    def _grad_beta(self, final_target_state, final_gen_state,
-                   A, B, herm_type):
-        """Gradient step w.r.t. \beta for a given Hermitian type (I/X/Y/Z).
-
-        Since \phi depends on \beta (and \psi does not), the \psi-term
-        gradient is always zero for \beta derivatives.
-
-        For the \phi-term: d/d\beta Tr[\phi · \rho_gen] follows the same
-        Kronecker product chain rule as \alpha, but applied to \phi.
-
-        The regularisation involves the derivative of A = exp(-\phi/\lambda),
-        which introduces a factor of cs = -1/\lambda.
-
-        Args:
-            final_target_state: Target (real data) quantum state vector.
-            final_gen_state: Generator's output quantum state vector.
-            A: exp(-\phi / \lambda).
-            B: exp(+\psi / \lambda).
-            herm_type: Index into {I, X, Y, Z} (0, 1, 2, 3).
-
-        Returns:
-            (gpsi, gphi, greg): Three lists, each of length self.size,
-            containing per-qubit gradient contributions.
-        """
-        cs = -1 / lamb  # Negative sign because A = exp(-\phi/\lambda)
-        # Gradient matrices for \phi: same structure as \psi but using \beta coefficients
-        grad_phi_list = self._grad_psi_or_phi(herm_type, respect_to="phi")
-        gpsi, gphi, greg = [], [], []
-
-        for grad_phi in grad_phi_list:
-            # \psi term: no dependence on \beta, so gradient is zero
-            gpsi.append(0)
-            # \phi term: <gen | d\phi/d\beta | gen>
-            gphi.append(np.ndarray.item(
-                braket(final_gen_state, grad_phi, final_gen_state)
-            ))
-
-            # Regularisation term: same structure as \alpha case but with
-            # d\phi replacing d\psi, and A replacing B in the brakets.
-            # fmt: off
-            t1 = cs * braket(final_gen_state, grad_phi, A, final_gen_state) * braket(final_target_state, B, final_target_state)
-            t2 = cs * braket(final_gen_state, B, final_target_state) * braket(final_target_state, grad_phi, A, final_gen_state)
-            t3 = cs * braket(final_gen_state, grad_phi, A, final_target_state) * braket(final_target_state, B, final_gen_state)
-            t4 = cs * braket(final_gen_state, B, final_gen_state) * braket(final_target_state, grad_phi, A, final_target_state)
-            greg.append(np.ndarray.item(lamb / np.e * (cst1 * t1 - cst2 * (t2 + t3) + cst3 * t4)))
-            # fmt: on
-
-        return gpsi, gphi, greg
-
-    def _grad_psi_or_phi(self, herm_type: int, respect_to: str) -> list:
-        """Gradient of \psi (or \phi) 
-
-        Because \psi (or \phi) is built as a tensor product of per-qubit
-        operators, the derivative w.r.t. the coefficient \alpha[i][herm_type]
-        (or \beta[i][herm_type]) has a simple form: it's the same tensor
-        product, but with qubit i's linear combination replaced by the bare
-        Pauli matrix \sigma_{herm_type}.
-
-        Args:
-            herm_type: Which Pauli to differentiate w.r.t. (0=I, 1=X, 2=Y, 3=Z).
-            respect_to: "psi" (use \alpha coefficients) or "phi" (use \beta).
-
-        Returns:
-            List of self.size matrices, each of shape (2^N, 2^N).
-        """
-        coefficients = self.alpha if respect_to == "psi" else self.beta
-
-        grad_matrices = []
-        for i in range(self.size):
-            # Build the tensor product, treating qubit i specially
-            matrix = 1
-            for j in range(self.size):
-                if i == j:
-                    # Derivative qubit: replace with the bare Pauli
-                    matrix_j = self.herm[herm_type]
-                else:
-                    # Non-derivative qubit: keep the full linear combination
-                    # H_j = \sum_k coeff[j][k] · \sigma_k
-                    matrix_j = np.zeros((2, 2), dtype=complex)
-                    for k, herm_k in enumerate(self.herm):
-                        matrix_j += coefficients[j][k] * herm_k
-                matrix = np.kron(matrix, matrix_j)
-            grad_matrices.append(matrix)
-
-        return grad_matrices
+        with torch.no_grad():
+            A, B, psi, phi = self.get_dis_matrices_rep()
+        return (
+            A.numpy(),
+            B.numpy(),
+            psi.numpy(),
+            phi.numpy(),
+        )
 
     # -- save / load ---------------------------------
-    # No big changes
+    def save_model(self, file_path: str):
+        """Save discriminator state to disk.
+
+        Saves both the nn.Module state_dict (alpha, beta) and metadata
+        needed for compatibility checks.
+        """
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        save_dict = {
+            "state_dict": self.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "size": self.size,
+            "ancilla": self.ancilla,
+            "ancilla_mode": self.ancilla_mode,
+            "target_size": self.target_size,
+            "target_hamiltonian": self.target_hamiltonian,
+        }
+        torch.save(save_dict, file_path)
+
     def load_model_params(self, file_path: str) -> bool:
+        """Load discriminator parameters from a saved model.
+
+        Supports loading from:
+            1. New torch format (state_dict + metadata)
+            2. Old numpy/pickle format (for backward compatibility)
+        """
         if not os.path.exists(file_path):
             print_and_log("Discriminator model file not found\n", CFG.log_path)
             return False
+
+        # Try torch format first
         try:
+            saved = torch.load(file_path, weights_only=False)
+            if isinstance(saved, dict) and "state_dict" in saved:
+                return self._load_from_torch_format(saved)
+        except Exception:
+            pass
+
+        # Fall back to old pickle format
+        try:
+            import pickle
             with open(file_path, "rb") as f:
                 saved_dis = pickle.load(f)
+            return self._load_from_pickle_format(saved_dis)
         except (OSError, pickle.UnpicklingError) as e:
             print_and_log(
                 f"ERROR: Could not load discriminator model: {e}\n", CFG.log_path
             )
             return False
 
-        # Compatibility checks, these must match exactly, otherwise the
-        # parameters would correspond to a different physical system.
-        cant_load = False
-        if saved_dis.target_size != self.target_size:
-            print_and_log(
-                "ERROR: target size mismatch.\n", CFG.log_path
-            )
-            cant_load = True
-        if saved_dis.target_hamiltonian != self.target_hamiltonian:
-            print_and_log(
-                "ERROR: target hamiltonian mismatch.\n", CFG.log_path
-            )
-            cant_load = True
-        if cant_load:
+    def _load_from_torch_format(self, saved: dict) -> bool:
+        """Load from new torch save format."""
+        # Compatibility checks
+        if saved.get("target_size") != self.target_size:
+            print_and_log("ERROR: target size mismatch.\n", CFG.log_path)
+            return False
+        if saved.get("target_hamiltonian") != self.target_hamiltonian:
+            print_and_log("ERROR: target hamiltonian mismatch.\n", CFG.log_path)
             return False
 
-        # Exact match, all parameters can be transferred directly
-        if saved_dis.size == self.size:
-            self.alpha = deepcopy(saved_dis.alpha)
-            self.beta = deepcopy(saved_dis.beta)
-            print_and_log("Discriminator parameters loaded.\n", CFG.log_path)
+        if saved.get("size") == self.size:
+            self.load_state_dict(saved["state_dict"])
+            if "optimizer_state" in saved:
+                self.optimizer.load_state_dict(saved["optimizer_state"])
+            print_and_log("Discriminator parameters loaded (torch format).\n", CFG.log_path)
             return True
 
-        # \pm 1 qubit (ancilla difference), partial parameter transfer.
-        # This handles the case where the saved model had an ancilla and
-        # the current one doesn't, or vice versa.
-        if abs(saved_dis.size - self.size) == 1:
-            min_size = min(saved_dis.size, self.size)
-            self.alpha[:min_size] = saved_dis.alpha[:min_size].copy()
-            self.beta[:min_size] = saved_dis.beta[:min_size].copy()
+        # \pm1 qubit (ancilla difference)
+        if abs(saved.get("size", 0) - self.size) == 1:
+            saved_alpha = saved["state_dict"]["alpha"]
+            saved_beta = saved["state_dict"]["beta"]
+            min_size = min(saved_alpha.shape[0], self.size)
+            with torch.no_grad():
+                self.alpha[:min_size] = saved_alpha[:min_size].clone()
+                self.beta[:min_size] = saved_beta[:min_size].clone()
             print_and_log(
-                "Discriminator parameters partially loaded (\pm 1 qubit).\n",
+                "Discriminator parameters partially loaded (\pm1 qubit, torch).\n",
                 CFG.log_path,
             )
             return True
 
-        # Size difference > 1: architectures are too different to transfer
-        print_and_log(
-            "ERROR: incompatible discriminator (size mismatch).\n", CFG.log_path
-        )
+        print_and_log("ERROR: incompatible discriminator (size mismatch).\n", CFG.log_path)
+        return False
+
+    def _load_from_pickle_format(self, saved_dis) -> bool:
+        """Load from old numpy/pickle format (backward compatibility)."""
+        cant_load = False
+        if saved_dis.target_size != self.target_size:
+            print_and_log("ERROR: target size mismatch.\n", CFG.log_path)
+            cant_load = True
+        if saved_dis.target_hamiltonian != self.target_hamiltonian:
+            print_and_log("ERROR: target hamiltonian mismatch.\n", CFG.log_path)
+            cant_load = True
+        if cant_load:
+            return False
+
+        if saved_dis.size == self.size:
+            with torch.no_grad():
+                self.alpha.copy_(torch.from_numpy(saved_dis.alpha))
+                self.beta.copy_(torch.from_numpy(saved_dis.beta))
+            print_and_log("Discriminator parameters loaded (pickle -> torch).\n", CFG.log_path)
+            return True
+
+        if abs(saved_dis.size - self.size) == 1:
+            min_size = min(saved_dis.size, self.size)
+            with torch.no_grad():
+                self.alpha[:min_size] = torch.from_numpy(
+                    saved_dis.alpha[:min_size].copy()
+                )
+                self.beta[:min_size] = torch.from_numpy(
+                    saved_dis.beta[:min_size].copy()
+                )
+            print_and_log(
+                "Discriminator parameters partially loaded (\pm1 qubit, pickle -> torch).\n",
+                CFG.log_path,
+            )
+            return True
+
+        print_and_log("ERROR: incompatible discriminator (size mismatch).\n", CFG.log_path)
         return False

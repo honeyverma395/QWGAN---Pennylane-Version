@@ -8,7 +8,7 @@ import traceback
 import numpy as np
 
 from config import CFG
-from qgan.training import Training
+from qgan.training import Training ##########
 from data.data_managers import get_last_experiment_idx, print_and_log, print_and_log_with_headers
 from plot_hub import generate_all_plots
 

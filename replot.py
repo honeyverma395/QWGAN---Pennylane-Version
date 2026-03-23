@@ -8,10 +8,8 @@ from plot_hub import find_if_common_initial_plateaus, generate_all_plots
 
 
 # ------- Parameters for the replotting script --------------
-
-
 # EXAMPLE TO EDIT PARAMETERS:
-time_stamp_to_replot = "2026-03-14__15-31-23" 
+time_stamp_to_replot = "2026-03-19__16-47-01" 
 max_fidelity = 0.99
 x_label = "Ancilla Topology"
 run_names = [

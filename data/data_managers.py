@@ -61,7 +61,8 @@ def save_gen_final_params(gen, file_path):
     Changed because in PennyLane gen.params (gen.qc.gates in previous code) 
     is already a flat array of angles """
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    np.savetxt(file_path, gen.params)
+    np.savetxt(file_path, gen.params.detach().numpy())
+    #np.savetxt(file_path, gen.params)
 
 def get_last_experiment_idx(base_path, common_initial_plateaus):
     """Return the highest experiment index in experimentX or 

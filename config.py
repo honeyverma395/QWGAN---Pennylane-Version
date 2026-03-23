@@ -21,7 +21,7 @@ class Config:
         self.common_initial_plateaus: bool = True
 
         # If common_initial_plateaus:
-        self.N_initial_plateaus: int = 2
+        self.N_initial_plateaus: int = 5
         self.N_reps_each_init_plateau: int = 1
 
         # If not common_initial_plateaus:
@@ -121,7 +121,7 @@ class Config:
 
         self.target_hamiltonian: Literal["cluster_h", "rotated_surface_h", "ising_h", "custom_h"] = "custom_h"
         self.custom_hamiltonian_terms: Optional[list[str]] = ["XZX", "ZZ"]
-        self.custom_hamiltonian_strengths: Optional[list[float]] = [0.2, 0.8]
+        self.custom_hamiltonian_strengths: Optional[list[float]] = [0.8, 0.2]
 
         # -- Optimiser --------------------------------------
         self.l_rate: float = 0.01
