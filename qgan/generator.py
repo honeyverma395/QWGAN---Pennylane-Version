@@ -1,3 +1,16 @@
+# Copyright 2025 GIQ, Universitat Autònoma de Barcelona
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Generator module — PyTorch + PennyLane rewrite.
 
 Replaces all manual gradient computation (_grad_theta, _param_shift_grad_state,
@@ -24,7 +37,7 @@ import torch.nn as nn
 import pennylane as qml
 
 from config import CFG
-from data.data_managers import print_and_log
+from tools.data_managers import print_and_log
 from qgan.ancilla import get_final_gen_state_torch
 
 # Wasserstein cost constants from config
@@ -410,7 +423,7 @@ class Generator:
         # Generator minimises the cost
         return cost
 
-    # -- training step (replaces update_gen) --------------------------------
+    # -- training step  --------------------------------
     def update_gen(self, dis, final_target_state: torch.Tensor):
         """One generator optimisation step (minimisation).
 
@@ -431,21 +444,6 @@ class Generator:
 
         with torch.no_grad():
             self.total_gen_state = self.get_total_gen_state()
-
-    # -- numpy interface, for backward compatibility -----------------------
-    def get_total_gen_state_numpy(self) -> np.ndarray:
-        """Return the cached statevector as a numpy column vector.
-        """
-        with torch.no_grad():
-            state = self.get_total_gen_state()
-        return np.asmatrix(state.detach().numpy().reshape(-1, 1))
-
-    def get_final_gen_state_numpy(self) -> np.ndarray:
-        """Return the final (post-ancilla) state as a numpy column vector."""
-        with torch.no_grad():
-            total = self.get_total_gen_state()
-            final = self.get_final_gen_state(total)
-        return np.asmatrix(final.detach().numpy().reshape(-1, 1))
 
     # -- pickle support ----------------------------------------------------
     def __getstate__(self):

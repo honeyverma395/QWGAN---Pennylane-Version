@@ -1,3 +1,16 @@
+# Copyright 2025 GIQ, Universitat Autònoma de Barcelona
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Configuration for the QGAN experiment
 No big changed from original """
 
@@ -59,7 +72,7 @@ class Config:
         # Load a previous run by timestamp. Supports \pm 1 qubit (ancilla add/remove).
 
         self.load_timestamp: Optional[str] = None # "2026-03-10__18-57-21"
-        self.type_of_warm_start: Literal["none", "all", "some"] = "none"
+        self.type_of_warm_start: Literal["none", "all", "some"] = "some"
         self.warm_start_strength: Optional[float] = 0.1
 
         # -- Training ------------------------------------------
@@ -88,7 +101,7 @@ class Config:
         #   trace   : trace out ancilla, sample pure state
 
         self.system_size: int = 3
-        self.extra_ancilla: bool = False #We begin with no extra qubits, but we add once we reach the Plateau
+        self.extra_ancilla: bool = False # We begin with no extra qubits, but we add once we reach the Plateau
         # Ancilla mode define what happens to the ancilla before Discriminator (ancilla.py)
         self.ancilla_mode: Optional[Literal["pass", "project", "trace"]] = "pass" 
         self.ancilla_project_norm: Optional[Literal["re-norm", "pass"]] = "re-norm"

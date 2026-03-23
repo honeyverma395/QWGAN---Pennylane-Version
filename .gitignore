@@ -6,3 +6,4 @@
 *.pyc
 generated_data/
 generated_data
+.DS_Store

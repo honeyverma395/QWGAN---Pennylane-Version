@@ -1,3 +1,16 @@
+# Copyright 2025 GIQ, Universitat Autònoma de Barcelona
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Training module for the Quantum GAN — PyTorch and PennyLane version.
 
 The training loop logic is unchanged from the original.
@@ -31,15 +44,15 @@ from qgan.ancilla import (
     get_max_entangled_state_torch,
 )
 from qgan.discriminator import Discriminator
-from qgan.cost_function import compute_fidelity_and_cost
+from qgan.cost_functions import compute_fidelity_and_cost
 from qgan.target import get_final_target_state
-from data.data_managers import (
+from tools.data_managers import (
     print_and_log,
     save_fidelity_loss,
     save_gen_final_params,
 )
-from data.loading_helpers import load_models_if_specified
-from plot_hub import plt_fidelity_vs_iter
+from tools.loading_helpers import load_models_if_specified
+from tools.plot_hub import plt_fidelity_vs_iter
 
 np.random.seed()
 

@@ -1,3 +1,16 @@
+# Copyright 2025 GIQ, Universitat Autònoma de Barcelona
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Training initialization module for running training instances"""
 
 import itertools
@@ -9,8 +22,8 @@ import numpy as np
 
 from config import CFG
 from qgan.training import Training ##########
-from data.data_managers import get_last_experiment_idx, print_and_log, print_and_log_with_headers
-from plot_hub import generate_all_plots
+from tools.data_managers import get_last_experiment_idx, print_and_log, print_and_log_with_headers
+from tools.plot_hub import generate_all_plots
 
 # ruff: noqa: E226
 # indicates that the linter (a program that automatically checks code quality) 
