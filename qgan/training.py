@@ -2,8 +2,8 @@
 
 The training loop logic is unchanged from the original.
 What changes:
-    - Generator and Discriminator are now PyTorch-PennyLane-based (see generator_torch.py,
-      discriminator_torch.py).
+    - Generator and Discriminator are now PyTorch-PennyLane-based (see generator.py,
+      discriminator.py).
     - States are torch tensors instead of numpy matrices.
     - Ancilla processing uses the torch functions from generator_torch.py.
     - cost_functions reduced to fidelity + cost evaluation (no braket).
