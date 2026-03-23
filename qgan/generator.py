@@ -504,11 +504,6 @@ class Generator:
 
     def load_model_params(self, file_path: str) -> bool:
         """Load generator parameters from a saved model.
-
-        Supports loading from:
-            1. New torch dict format (from save_model)
-            2. Old PennyLane/numpy format (pickle of Generator object)
-            3. Very old format (pickle with .qc.gates)
         """
         if not os.path.exists(file_path):
             print_and_log("ERROR: Generator model file not found\n", CFG.log_path)
