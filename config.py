@@ -34,11 +34,11 @@ class Config:
         self.common_initial_plateaus: bool = True
 
         # If common_initial_plateaus:
-        self.N_initial_plateaus: int = 5
+        self.N_initial_plateaus: int = 3
         self.N_reps_each_init_plateau: int = 1
 
         # If not common_initial_plateaus:
-        self.N_reps_if_from_scratch: int = 3
+        self.N_reps_if_from_scratch: int = 1
 
         # Configurations to compare (each dict overrides CFG attributes):
         self.reps_new_config: list[dict[str, Any]] = [
@@ -71,8 +71,8 @@ class Config:
         # -- Loading and warm start ----------------------------
         # Load a previous run by timestamp. Supports \pm 1 qubit (ancilla add/remove).
 
-        self.load_timestamp: Optional[str] = None # "2026-03-10__18-57-21"
-        self.type_of_warm_start: Literal["none", "all", "some"] = "some"
+        self.load_timestamp: Optional[str] = None #"2026-03-23__14-41-35"
+        self.type_of_warm_start: Literal["none", "all", "some"] = "none"
         self.warm_start_strength: Optional[float] = 0.1
 
         # -- Training ------------------------------------------
@@ -105,7 +105,7 @@ class Config:
         # Ancilla mode define what happens to the ancilla before Discriminator (ancilla.py)
         self.ancilla_mode: Optional[Literal["pass", "project", "trace"]] = "pass" 
         self.ancilla_project_norm: Optional[Literal["re-norm", "pass"]] = "re-norm"
-        self.ancilla_topology: Optional[Literal["disconnected", "ansatz", "bridge", "total", "fake"]] = "bridge"
+        self.ancilla_topology: Optional[Literal["disconnected", "ansatz", "bridge", "total", "fake"]] = "total"
         self.ancilla_connect_to: Optional[int] = None
         self.do_ancilla_1q_gates: bool = True
         self.start_ancilla_gates_randomly: bool = True
@@ -123,7 +123,7 @@ class Config:
 
         self.gen_layers: int = 3
 
-        self.gen_ansatz: Literal["ZZ_YY_XX_Z", "ZZ_Z_X", "custom"] = "custom"
+        self.gen_ansatz: Literal["ZZ_YY_XX_Z", "ZZ_Z_X", "custom"] = "ZZ_Z_X"
         self.custom_ansatz_terms: Optional[list[str]] = ["ZZ", "XX", "Y", "X"]
 
         # -- Target Hamiltonian ----------------------------
@@ -131,10 +131,10 @@ class Config:
         # Predefined: cluster_h, ising_h, rotated_surface_h (squared qubits only)
         # Custom: specify terms and strengths.
         #   Available: I, X, Y, Z, XX, XZ, ZZ, ZZZ, ZZZZ, XZX, XXXX
-
+        self.time_to_evolve: float = 1.0  # Time to evolve with the Hamiltonian, for the target state preparation.
         self.target_hamiltonian: Literal["cluster_h", "rotated_surface_h", "ising_h", "custom_h"] = "custom_h"
-        self.custom_hamiltonian_terms: Optional[list[str]] = ["XZX", "ZZ"]
-        self.custom_hamiltonian_strengths: Optional[list[float]] = [0.8, 0.2]
+        self.custom_hamiltonian_terms: Optional[list[str]] = ["ZZZ"]
+        self.custom_hamiltonian_strengths: Optional[list[float]] = [1.0]
 
         # -- Optimiser --------------------------------------
         self.l_rate: float = 0.01
@@ -195,6 +195,7 @@ class Config:
             f"gen_ansatz: {self.gen_ansatz}\n"
             f"custom_ansatz_terms: {self.custom_ansatz_terms}\n"
             f"{sep}\n"
+            f"time_to_evolve: {self.time_to_evolve},\n"
             f"target_hamiltonian: {self.target_hamiltonian}\n"
             f"custom_hamiltonian_terms: {self.custom_hamiltonian_terms}\n"
             f"custom_hamiltonian_strengths: {self.custom_hamiltonian_strengths}\n"
